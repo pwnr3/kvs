@@ -1,6 +1,8 @@
 extern crate clap;
 
 use clap::{Args, Parser, Subcommand};
+use kvs::{ErrorKind, KvStore, Result};
+use std::env::current_dir;
 use std::process;
 
 #[derive(Parser)]
@@ -39,7 +41,7 @@ struct SetCommand {
     /// A string key.
     key: String,
     /// The string value of the key.
-    value: String,
+    val: String,
 }
 
 #[derive(Args)]
@@ -48,21 +50,36 @@ struct RemoveCommand {
     key: String,
 }
 
-fn main() {
+fn main() -> Result<()> {
     let args = Arg::parse();
 
     match &args.command {
-        Commands::Get(_) => {
-            eprintln!("unimplemented");
-            process::exit(1);
+        Commands::Get(cmd) => {
+            let key = cmd.key.clone();
+            let mut store = KvStore::open(current_dir()?)?;
+            if let Some(val) = store.get(key)? {
+                println!("{}", val);
+            } else {
+                println!("Key not found");
+            }
         }
-        Commands::Set(_) => {
-            eprintln!("unimplemented");
-            process::exit(1);
+        Commands::Set(cmd) => {
+            let mut store = KvStore::open(current_dir()?)?;
+            store.set(cmd.key.clone(), cmd.val.clone())?;
         }
-        Commands::Rm(_) => {
-            eprintln!("unimplemented");
-            process::exit(1);
+        Commands::Rm(cmd) => {
+            let key = cmd.key.clone();
+            let mut store = KvStore::open(current_dir()?)?;
+            match store.remove(key) {
+                Ok(_) => {}
+                Err(ErrorKind::KeyNotFound) => {
+                    println!("Key not found");
+                    process::exit(1);
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
+
+    Ok(())
 }
