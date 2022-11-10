@@ -1,4 +1,4 @@
-use crate::{ErrorKind, Result};
+use crate::{ErrorKind, KvsEngine, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 use std::collections::HashMap;
@@ -18,7 +18,7 @@ const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 /// Example:
 ///
 /// ```rust
-/// # use kvs::KvStore;
+/// # use kvs::{KvsEngine, KvStore};
 /// # use tempfile::TempDir;
 /// let temp_dir = TempDir::new().unwrap();
 /// let mut store = KvStore::open(temp_dir.path()).unwrap();
@@ -35,11 +35,8 @@ pub struct KvStore {
     readers: HashMap<u64, BufReaderWithPos<File>>,
 }
 
-impl KvStore {
-    /// Set the value of a string key to a string.
-    ///
-    /// Return an error if the value is not written successfully.
-    pub fn set(&mut self, key: String, val: String) -> Result<()> {
+impl KvsEngine for KvStore {
+    fn set(&mut self, key: String, val: String) -> Result<()> {
         let command = Command::Set {
             key: key.clone(),
             val: val,
@@ -62,12 +59,7 @@ impl KvStore {
         Ok(())
     }
 
-    /// Get the string value of a string key.
-    ///
-    /// If the key does not exist, return None.
-    ///
-    /// Return an error if the value is not read successfully.
-    pub fn get(&mut self, key: String) -> Result<Option<String>> {
+    fn get(&mut self, key: String) -> Result<Option<String>> {
         if let Some(rec) = self.db.get(&key) {
             //let f = File::open(&self.path.join(format!("{}.log", rec.fname.to_string())))?;
             //let mut reader = BufReader::new(f);
@@ -87,10 +79,7 @@ impl KvStore {
         }
     }
 
-    /// Remove a given key.
-    ///
-    /// Return an error if the key does not exist or is not removed successfully.
-    pub fn remove(&mut self, key: String) -> Result<()> {
+    fn remove(&mut self, key: String) -> Result<()> {
         if let Some(_cmd) = self.db.remove(&key) {
             let command = Command::Remove { key: key };
             write!(self.writer, "{}", serde_json::to_string(&command)?)?;
@@ -102,7 +91,9 @@ impl KvStore {
             Err(ErrorKind::KeyNotFound)
         }
     }
+}
 
+impl KvStore {
     /// Open the KvStore at a given path. Return the KvStore.
     pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
         let path = path.into();
