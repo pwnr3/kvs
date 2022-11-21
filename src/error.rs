@@ -1,3 +1,4 @@
+use rayon::ThreadPoolBuildError;
 use sled;
 use std::io;
 use std::str::Utf8Error;
@@ -22,6 +23,14 @@ pub enum ErrorKind {
     KeyNotFound,
     /// Other
     Other(String),
+    /// Rayon
+    Rayon(ThreadPoolBuildError),
+}
+
+impl From<ThreadPoolBuildError> for ErrorKind {
+    fn from(err: ThreadPoolBuildError) -> ErrorKind {
+        ErrorKind::Rayon(err)
+    }
 }
 
 impl From<sled::Error> for ErrorKind {

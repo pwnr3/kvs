@@ -2,21 +2,27 @@ use crate::Result;
 use serde::{Deserialize, Serialize};
 
 /// Trait for different engine.
-pub trait KvsEngine {
+pub trait KvsEngine: Send + 'static {
     /// Set the value of a string key to a string.
     ///
+    /// # Errors
+    ///
     /// Return an error if the value is not written successfully.
-    fn set(&mut self, key: String, value: String) -> Result<()>;
+    fn set(&self, key: String, value: String) -> Result<()>;
     /// Get the string value of a string key.
     ///
     /// If the key does not exist, return None.
     ///
+    /// # Errors
+    ///
     /// Return an error if the value is not read successfully.
-    fn get(&mut self, key: String) -> Result<Option<String>>;
+    fn get(&self, key: String) -> Result<Option<String>>;
     /// Remove a given key.
     ///
+    /// # Errors
+    ///
     /// Return an error if the key does not exist or is not removed successfully.
-    fn remove(&mut self, key: String) -> Result<()>;
+    fn remove(&self, key: String) -> Result<()>;
 }
 
 /// Message from client to server.

@@ -1,4 +1,5 @@
 use crate::{ErrorKind, KvsEngine, Result};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 use std::collections::HashMap;
@@ -8,6 +9,10 @@ use std::io::prelude::*;
 use std::io::{self, BufReader, BufWriter, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
 const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 
@@ -27,44 +32,51 @@ const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 /// assert_eq!(val, Some("value".to_owned()));
 /// ```
 pub struct KvStore {
-    db: HashMap<String, CommandPointer>,
-    path: PathBuf,
-    fname: u64,
-    trash: u64,
-    writer: BufWriterWithPos<File>,
-    readers: HashMap<u64, BufReaderWithPos<File>>,
+    db: Arc<DashMap<String, CommandPointer>>, // use DashMap to replace RwLock<HashMap<K, V>>
+    path: Arc<PathBuf>,
+    fname: AtomicU64,
+    trash: AtomicU64,
+    writer: Arc<Mutex<BufWriterWithPos<File>>>,
+    readers: Arc<Mutex<HashMap<u64, BufReaderWithPos<File>>>>,
 }
 
 impl KvsEngine for KvStore {
-    fn set(&mut self, key: String, val: String) -> Result<()> {
+    fn set(&self, key: String, val: String) -> Result<()> {
         let command = Command::Set {
             key: key.clone(),
             val: val,
         };
-        let pos = self.writer.pos;
-        //write!(self.writer, "{}", serde_json::to_string(&command)?)?;
-        serde_json::to_writer(&mut self.writer, &command)?;
-        self.writer.flush()?;
+        let mut writer = self.writer.lock().unwrap();
+        let pos = writer.pos;
+        //write!(writer, "{}", serde_json::to_string(&command)?)?;
+        serde_json::to_writer(&mut *writer, &command)?;
+        //writer.write(serde_json::to_vec(&command)?.as_slice())?;
+        writer.flush()?;
+        let new_pos = writer.pos;
+        drop(writer);
 
-        if let Some(old_cmd) = self
-            .db
-            .insert(key, (self.fname, pos..self.writer.pos).into())
-        {
-            self.trash += old_cmd.len;
+        let mut trash = self.trash.load(Ordering::SeqCst);
+        if let Some(old_cmd) = self.db.insert(
+            key,
+            (self.fname.load(Ordering::SeqCst), pos..new_pos).into(),
+        ) {
+            trash += old_cmd.len;
+            self.trash.store(trash, Ordering::SeqCst);
         }
+        //drop(db); // if not explictly drop here, `compaction` test will fail
 
-        if self.trash >= COMPACTION_THRESHOLD {
+        if trash >= COMPACTION_THRESHOLD {
             self.compact()?;
         }
         Ok(())
     }
 
-    fn get(&mut self, key: String) -> Result<Option<String>> {
+    fn get(&self, key: String) -> Result<Option<String>> {
         if let Some(rec) = self.db.get(&key) {
             //let f = File::open(&self.path.join(format!("{}.log", rec.fname.to_string())))?;
             //let mut reader = BufReader::new(f);
-            let reader = self
-                .readers
+            let mut readers = self.readers.lock().unwrap();
+            let reader = readers
                 .get_mut(&rec.fname)
                 .expect("Could not open log reader"); // will make `&self -> &mut self`
             reader.seek(SeekFrom::Start(rec.pos))?;
@@ -79,13 +91,18 @@ impl KvsEngine for KvStore {
         }
     }
 
-    fn remove(&mut self, key: String) -> Result<()> {
-        if let Some(_cmd) = self.db.remove(&key) {
+    fn remove(&self, key: String) -> Result<()> {
+        if let Some((_, cmd)) = self.db.remove(&key) {
             let command = Command::Remove { key: key };
-            write!(self.writer, "{}", serde_json::to_string(&command)?)?;
-            self.writer.flush()?;
+            let mut writer = self.writer.lock().unwrap();
+            write!(writer, "{}", serde_json::to_string(&command)?)?;
+            writer.flush()?;
 
-            // compact here
+            let trash = self.trash.load(Ordering::SeqCst) + cmd.len;
+            self.trash.store(trash, Ordering::SeqCst);
+            if trash >= COMPACTION_THRESHOLD {
+                self.compact()?;
+            }
             Ok(())
         } else {
             Err(ErrorKind::KeyNotFound)
@@ -99,7 +116,7 @@ impl KvStore {
         let path = path.into();
 
         let list = sorted_gen_list(&path)?;
-        let mut db: HashMap<String, CommandPointer> = HashMap::new();
+        let db: DashMap<String, CommandPointer> = DashMap::new();
         let mut readers = HashMap::new();
         let mut trash = 0;
 
@@ -117,7 +134,7 @@ impl KvStore {
                         }
                     }
                     Command::Remove { key } => {
-                        if let Some(old_cmd) = db.remove(&key) {
+                        if let Some((_, old_cmd)) = db.remove(&key) {
                             trash += old_cmd.len;
                         };
                         trash += new_pos - pos;
@@ -132,25 +149,27 @@ impl KvStore {
         let writer = new_log_file(&path, fname, &mut readers)?;
 
         Ok(KvStore {
-            db: db,
-            path: path,
-            fname: fname,
-            trash: trash,
-            writer: writer,
-            readers: readers,
+            db: Arc::new(db),
+            path: Arc::new(path),
+            fname: AtomicU64::new(fname),
+            trash: AtomicU64::new(trash),
+            writer: Arc::new(Mutex::new(writer)),
+            readers: Arc::new(Mutex::new(readers)),
         })
     }
 
     /// Compact log file.
-    pub fn compact(&mut self) -> Result<()> {
+    pub fn compact(&self) -> Result<()> {
+        println!("Compaction start");
+        let old_fname = self.fname.load(Ordering::SeqCst);
         // compact file
-        let compact_fname = self.fname + 1;
+        let compact_fname = old_fname + 1;
         let mut readers = HashMap::new();
         let mut writer = new_log_file(&self.path, compact_fname, &mut readers)?;
         let mut pos = 0;
-        for cmd_pointer in self.db.values_mut() {
-            let reader = self
-                .readers
+        let mut old_readers = self.readers.lock().unwrap();
+        for mut cmd_pointer in self.db.iter_mut() {
+            let reader = old_readers
                 .get_mut(&cmd_pointer.fname)
                 .expect("Could not open log reader");
             if reader.pos != cmd_pointer.pos {
@@ -165,16 +184,36 @@ impl KvStore {
         writer.flush()?;
 
         // new writer
-        self.fname += 2;
-        self.writer = new_log_file(&self.path, self.fname, &mut readers)?;
+        self.fname.store(old_fname + 2, Ordering::SeqCst);
+        *self.writer.lock().unwrap() = new_log_file(&self.path, old_fname + 2, &mut readers)?;
 
+        //drop(old_readers); // program will stuck without this line, stupid mistake
+        //// remove stale log
+        //for fname in self.readers.lock().unwrap().keys() {
+        //    fs::remove_file(self.path.join(format!("{}.log", fname)))?;
+        //}
+        //*self.readers.lock().unwrap() = readers;
         // remove stale log
-        for fname in self.readers.keys() {
+        for fname in old_readers.keys() {
+            println!("removing {}", fname);
             fs::remove_file(self.path.join(format!("{}.log", fname)))?;
         }
-        self.readers = readers;
-        self.trash = 0;
+        *old_readers = readers;
+        self.trash.store(0, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+impl Clone for KvStore {
+    fn clone(&self) -> Self {
+        Self {
+            db: Arc::clone(&self.db),
+            path: Arc::clone(&self.path),
+            fname: AtomicU64::new(self.fname.load(Ordering::SeqCst)),
+            trash: AtomicU64::new(self.trash.load(Ordering::SeqCst)),
+            writer: Arc::clone(&self.writer),
+            readers: Arc::clone(&self.readers),
+        }
     }
 }
 
@@ -216,7 +255,7 @@ enum Command {
     Remove { key: String },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CommandPointer {
     fname: u64,
     pos: u64,
@@ -237,6 +276,15 @@ struct BufReaderWithPos<R: Read + Seek> {
     reader: BufReader<R>,
     pos: u64,
 }
+
+//impl<R: Read + Seek> Clone for BufReaderWithPos<R> {
+//    fn clone(&self) -> Self {
+//        Self {
+//            reader: BufReader::new(*self.reader.get_ref()),
+//            pos: self.pos,
+//        }
+//    }
+//}
 
 impl<R: Read + Seek> BufReaderWithPos<R> {
     fn new(inner: R) -> BufReaderWithPos<R> {
@@ -269,6 +317,15 @@ struct BufWriterWithPos<W: Write + Seek> {
     writer: BufWriter<W>,
     pos: u64,
 }
+
+//impl<W: Write + Seek> Clone for BufWriterWithPos<W> {
+//    fn clone(&self) -> Self {
+//        Self {
+//            writer: BufWriter::new(*self.writer.get_ref()),
+//            pos: self.pos,
+//        }
+//    }
+//}
 
 impl<W: Write + Seek> BufWriterWithPos<W> {
     fn new(inner: W) -> BufWriterWithPos<W> {

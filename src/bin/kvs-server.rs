@@ -1,9 +1,10 @@
 use clap::{Arg, Command};
+use kvs::thread_pool::{SharedQueueThreadPool, ThreadPool};
 use kvs::{ErrorKind, KvStore, KvsEngine, Logger, Message, Result, SledKvsEngine};
 use log;
 use std::env::current_dir;
 use std::io::{BufRead, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 
 fn main() -> Result<()> {
     Logger::init().map_err(|e| ErrorKind::Other(format!("{:?}", e)))?;
@@ -65,11 +66,13 @@ fn main() -> Result<()> {
     let listener = TcpListener::bind(addr)?;
     log::info!("start kvs-server 0.1.0 at {}", addr);
 
+    let pool = SharedQueueThreadPool::new(4)?;
+
     // `impl trait` as argument type or return type
     if engine == "kvs" {
-        run(KvStore::open(current_dir()?)?, listener)?;
+        run(KvStore::open(current_dir()?)?, pool, listener)?;
     } else {
-        run(SledKvsEngine::open(current_dir()?)?, listener)?;
+        run(SledKvsEngine::open(current_dir()?)?, pool, listener)?;
     }
     Ok(())
 
@@ -114,34 +117,49 @@ fn main() -> Result<()> {
 }
 
 // or `store: impl KvsEngine`
-fn run<T: KvsEngine>(mut store: T, listener: TcpListener) -> Result<()> {
+fn run<T: KvsEngine + Clone, P: ThreadPool>(
+    store: T,
+    pool: P,
+    listener: TcpListener,
+) -> Result<()> {
     loop {
-        let (mut socket, addr) = listener.accept()?;
+        let (socket, addr) = listener.accept()?;
         log::info!("Connection from {}", addr);
 
-        let mut msg = vec![0; 128];
-        let len = socket.read(&mut msg)?;
-        let msg: Message = serde_json::from_slice(&msg[..len])?;
-        log::info!("{:?}", msg);
-
-        match msg {
-            Message::Get { key } => {
-                if let Some(val) = store.get(key)? {
-                    socket.write(val.as_bytes())?;
-                } else {
-                    socket.write(b"Key not found")?;
-                }
+        let store = store.clone();
+        pool.spawn(move || {
+            if let Err(e) = job(store, socket) {
+                log::info!("Job error: {:?}", e);
             }
-            Message::Set { key, val } => {
-                store.set(key, val)?;
-            }
-            Message::Rm { key } => match store.remove(key) {
-                Ok(_) => {}
-                Err(ErrorKind::KeyNotFound) => {
-                    socket.write(b"Key not found")?;
-                }
-                Err(e) => return Err(e),
-            },
-        }
+        });
     }
+}
+
+fn job<T: KvsEngine + Clone>(store: T, mut socket: TcpStream) -> Result<()> {
+    let mut msg = vec![0; 128];
+    let len = socket.read(&mut msg)?;
+    let msg: Message = serde_json::from_slice(&msg[..len])?;
+    log::info!("{:?}", msg);
+
+    match msg {
+        Message::Get { key } => {
+            if let Some(val) = store.get(key)? {
+                socket.write(val.as_bytes())?;
+            } else {
+                socket.write(b"Key not found")?;
+            }
+        }
+        Message::Set { key, val } => {
+            store.set(key, val)?;
+        }
+        Message::Rm { key } => match store.remove(key) {
+            Ok(_) => {}
+            Err(ErrorKind::KeyNotFound) => {
+                socket.write(b"Key not found")?;
+            }
+            Err(e) => return Err(e),
+        },
+    }
+
+    Ok(())
 }
